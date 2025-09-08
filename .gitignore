@@ -144,6 +144,12 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local Hugging Face cache (project-scoped)
+.hf/
+
+# Misc local logs
+cloudflared.log
+
 # Spyder project settings
 .spyderproject
 .spyproject

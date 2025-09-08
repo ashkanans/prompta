@@ -1,0 +1,30 @@
+[project]
+name = "prompta"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.10.1",
+    "fastapi>=0.116.1",
+    "pydantic>=2.11.7",
+    "pydantic-settings>=2.10.1",
+    "safetensors>=0.6.2",
+    "transformers>=4.43,<5.0",
+    "uvicorn[standard]>=0.35.0",
+    "numpy>=1.26",
+    "torch>=2.4",
+    "sse-starlette>=2.1.0",
+]
+
+[project.optional-dependencies]
+hf = [
+    "hf_transfer>=0.1.8",
+]
+
+[tool.uv]
+dev-dependencies = []
+
+[tool.uv.scripts]
+serve = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+serve-reload = "uvicorn app.main:app --reload"
