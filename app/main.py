@@ -3,9 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings, apply_environment
 from app.core.logging import configure_logging
-from app.core.errors import register_exception_handlers
 from app.core.middleware import RequestContextMiddleware
-from app.api import health, batch, completions
+from app.api import completions
+from app.core.errors import register_exception_handlers
 from fastapi.routing import APIRoute
 
 apply_environment(settings)
@@ -30,8 +30,6 @@ app.add_middleware(RequestContextMiddleware)
 
 register_exception_handlers(app)
 
-app.include_router(health.router, prefix="")
-app.include_router(batch.router, prefix="/batch", tags=["batch"])
 app.include_router(completions.router, prefix="")
 
 @app.get("/")
