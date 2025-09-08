@@ -18,8 +18,8 @@ class StreamOptions(BaseModel):
 
 
 class CompletionsRequest(BaseModel):
-    # Required by OpenAI; default to settings when omitted for convenience
-    model: Optional[str] = None
+    # Default to configured model if omitted
+    model: str = Field(default_factory=lambda: settings.MODEL_ID)
     prompt: PromptType
 
     suffix: Optional[str] = None
@@ -38,11 +38,6 @@ class CompletionsRequest(BaseModel):
     stream_options: Optional[StreamOptions] = None
     user: Optional[str] = None
     logit_bias: Optional[Dict[Union[str, int], float]] = None
-
-    @field_validator("model", mode="before")
-    @classmethod
-    def default_model(cls, v):
-        return v or settings.MODEL_ID
 
     @field_validator("prompt", mode="before")
     @classmethod
@@ -198,4 +193,3 @@ class CompletionsResponse(BaseModel):
     system_fingerprint: Optional[str] = None
     choices: List[CompletionChoice]
     usage: Usage
-

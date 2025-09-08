@@ -28,8 +28,6 @@ async def create_completion(
     in subsequent steps.
     """
     model = payload.model
-    if not model:
-        raise HTTPException(status_code=400, detail="model is required")
 
     created = int(time())
     try:
