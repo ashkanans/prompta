@@ -3,7 +3,13 @@ from time import time
 from fastapi import APIRouter, HTTPException, Depends
 
 from app.core.config import system_fingerprint
-from app.schemas import CompletionsRequest, CompletionsResponse, CompletionChoice, Usage
+from app.schemas import (
+    CompletionsRequest,
+    CompletionsResponse,
+    CompletionChoice,
+    Usage,
+    LogProbs,
+)
 from app.core.auth import require_bearer_token
 from app.services.inference import generate_completions
 
@@ -31,15 +37,24 @@ async def create_completion(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    choices = [
-        CompletionChoice(
-            text=t,
-            index=i,
-            logprobs=None,
-            finish_reason=("length" if gen.reached_max else "stop"),
+    choices = []
+    for i, c in enumerate(gen.choices):
+        lp = None
+        if payload.logprobs:
+            lp = LogProbs(
+                tokens=c.tokens,
+                token_logprobs=c.token_logprobs,
+                top_logprobs=c.top_logprobs,  # type: ignore
+                text_offset=None,
+            )
+        choices.append(
+            CompletionChoice(
+                text=c.text,
+                index=i,
+                logprobs=lp,
+                finish_reason=c.finish_reason,
+            )
         )
-        for i, t in enumerate(gen.texts)
-    ]
 
     usage = Usage(
         prompt_tokens=gen.prompt_tokens,
