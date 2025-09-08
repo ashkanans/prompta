@@ -34,10 +34,6 @@ app.include_router(health.router, prefix="")
 app.include_router(batch.router, prefix="/batch", tags=["batch"])
 app.include_router(completions.router, prefix="")
 
-@app.get("/")
-async def root():
-    return {"name": settings.APP_NAME, "version": settings.APP_VERSION}
-
 @app.get("/routes")
 async def list_routes():
     route_list = []
@@ -49,3 +45,8 @@ async def list_routes():
                 "methods": list(route.methods)
             })
     return {"routes": route_list}
+
+@app.get("/")
+async def root():
+    return {"name": settings.APP_NAME, "version": settings.APP_VERSION}
+
