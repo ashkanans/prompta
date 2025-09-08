@@ -1,82 +1,129 @@
 from __future__ import annotations
 
-import threading
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.generation import (  # type: ignore
-    StoppingCriteria,
-    StoppingCriteriaList,
-)
 
 from app.core.config import settings
 from app.schemas import CompletionsRequest
 
 
-# Readiness flag; set True once the model is loaded.
-_MODEL_READY: bool = False
-_LOAD_LOCK = threading.Lock()
-_TOKENIZER = None
-_MODEL = None
+# Minimal, single-path inference service using HF + Harmony
+
+_tokenizer = None
+_model = None
+
+
+def _load_model_once():
+    global _tokenizer, _model
+    if _tokenizer is None or _model is None:
+        model_id = settings.MODEL_ID
+        _tokenizer = AutoTokenizer.from_pretrained(model_id)
+        _model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype="auto",
+            device_map="cuda",
+        )
+        try:
+            print("Loaded:", model_id, "on", torch.cuda.get_device_name(0))
+        except Exception:
+            print("Loaded:", model_id)
+    return _tokenizer, _model
 
 
 def is_model_ready() -> bool:
-    return _MODEL_READY
+    tok, mdl = _tokenizer, _model
+    return tok is not None and mdl is not None
 
 
-def current_model_id() -> str:
-    return settings.MODEL_ID
+# Harmony encoding
+from openai_harmony import load_harmony_encoding, HarmonyEncodingName, Role  # type: ignore
+
+enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
 
-def _parse_dtype(name: str | None):
-    if not name or name.lower() == "auto":
-        return None
-    name = name.lower()
-    if name in ("fp16", "float16"):
-        return torch.float16
-    if name in ("bf16", "bfloat16"):
-        return torch.bfloat16
-    if name in ("fp32", "float32"):
-        return torch.float32
-    return None
+def complete(prompt: str, system_prompt: str = "", max_new_tokens: int = 256, reasoning: str = "medium", temperature: float = 0.7) -> str:
+    tokenizer, model = _load_model_once()
+
+    messages = [
+        {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
+        {"role": "user", "content": prompt},
+    ]
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    ).to(model.device)
+
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            do_sample=True,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    new_tokens = generated[0][inputs["input_ids"].shape[-1]:].tolist()
+
+    msgs = enc.parse_messages_from_completion_tokens(new_tokens, role=Role.ASSISTANT)
+    finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
+    return finals[-1].content if finals else tokenizer.decode(new_tokens)
 
 
-def _choose_device() -> str:
-    dm = (settings.DEVICE_MAP or "auto").lower()
-    if dm == "cuda" and torch.cuda.is_available():
-        return "cuda"
-    if dm == "cpu" or not torch.cuda.is_available():
-        return "cpu"
-    # auto
-    return "cuda" if torch.cuda.is_available() else "cpu"
+def complete_batch(
+    prompts: List[Tuple[str, str]],
+    max_new_tokens: int = 256,
+    reasoning: str = "medium",
+    temperature: float = 0.7,
+) -> List[str]:
+    """
+    prompts: list of (system_prompt, user_prompt)
+    returns: list[str] model outputs, one per input pair
+    """
+    tokenizer, model = _load_model_once()
 
+    conversations = [
+        [
+            {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
+            {"role": "user", "content": user_prompt},
+        ]
+        for system_prompt, user_prompt in prompts
+    ]
 
-def _lazy_load():
-    model_id = current_model_id()
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype="auto",
-        device_map="cuda",
-    )
-    return tokenizer, model
+    inputs = tokenizer.apply_chat_template(
+        conversations,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+        padding=True,
+        truncation=True,
+    ).to(model.device)
 
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            do_sample=True,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.pad_token_id,
+        )
 
-class StopOnSequences(StoppingCriteria):
-    def __init__(self, tokenizer, stops: Sequence[str]):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.stops = list(stops)
+    input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> bool:  # type: ignore
-        # Check last sequence only
-        text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        for s in self.stops:
-            if text.endswith(s):
-                return True
-        return False
+    outputs: List[str] = []
+    for i, in_len in enumerate(input_lengths):
+        new_tokens = generated[i, in_len:].tolist()
+        msgs = enc.parse_messages_from_completion_tokens(new_tokens, role=Role.ASSISTANT)
+        finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
+        text = finals[-1].content if finals else tokenizer.decode(new_tokens)
+        outputs.append(text)
+
+    return outputs
 
 
 @dataclass
@@ -84,7 +131,7 @@ class ChoiceOut:
     text: str
     tokens: List[str]
     token_logprobs: List[Optional[float]]
-    top_logprobs: Optional[List[Optional[Dict[str, float]]]]
+    top_logprobs: Optional[List[dict]]
     finish_reason: str
     completion_tokens: int
 
@@ -96,232 +143,55 @@ class GenerationResult:
     completion_tokens: int
 
 
-def _strip_stop(text: str, stops: Optional[Sequence[str]]) -> Tuple[str, bool]:
-    if not stops:
-        return text, False
-    for s in stops:
-        if text.endswith(s):
-            return text[: -len(s)], True
-    return text, False
-
-
 def generate_completions(req: CompletionsRequest) -> GenerationResult:
-    tokenizer, model = _lazy_load()
-    device = _choose_device()
-
+    # Normalize input to a list of prompts
     prompts: List[str] = req.prompt if isinstance(req.prompt, list) else [req.prompt]
 
-    # Prepare generation settings
-    max_new_tokens = req.max_tokens or 16
-    temperature = req.temperature if req.temperature is not None else 1.0
-    top_p = req.top_p if req.top_p is not None else 1.0
-    n = req.n or 1
-    best_of = req.best_of or n
-    if best_of < n:
-        raise ValueError("best_of must be >= n")
-    if req.stream and best_of > 1:
-        raise ValueError("streaming is not supported with best_of > 1")
-    do_sample = (temperature and temperature > 0) or (top_p and top_p < 1.0) or (n > 1)
+    # Build (system, user) pairs
+    sys = req.system_prompt or ""
+    pairs: List[Tuple[str, str]] = [(sys, p) for p in prompts]
 
-    # Build stopping criteria
-    stopping = StoppingCriteriaList()
-    stops = None
-    if req.stop is not None:
-        stops = req.stop if isinstance(req.stop, list) else [req.stop]
-        if stops:
-            stopping.append(StopOnSequences(tokenizer, stops))
+    # Default params to match the requested flow
+    max_new = req.max_tokens or 600
+    reasoning = req.reasoning or "medium"
+    temperature = 0.1 if req.temperature is None else req.temperature
 
-    # Penalties
-    logits_processor = None
-    try:
-        from transformers.generation.logits_process import (  # type: ignore
-            LogitsProcessorList,
-            RepetitionPenaltyLogitsProcessor,
-            FrequencyAndPresencePenaltyLogitsProcessor,
+    t0 = time.time()
+    texts = complete_batch(pairs, max_new_tokens=max_new, reasoning=reasoning, temperature=temperature)
+    t1 = time.time()
+    _ = (t0, t1)  # kept for clarity; times can be logged if needed
+
+    tokenizer, _model_ref = _load_model_once()
+
+    choices: List[ChoiceOut] = []
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    # Rough token accounting: chat template for prompt; plain encode for output
+    for (system_prompt, user_prompt), text in zip(pairs, texts):
+        conv = [
+            {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
+            {"role": "user", "content": user_prompt},
+        ]
+        enc_in = tokenizer.apply_chat_template(conv, add_generation_prompt=True, return_tensors="pt")
+        prompt_tok = int(enc_in.shape[-1]) if hasattr(enc_in, "shape") else len(enc_in[0])  # type: ignore
+        comp_tok = len(tokenizer.encode(text))
+        total_prompt_tokens += prompt_tok
+        total_completion_tokens += comp_tok
+
+        choices.append(
+            ChoiceOut(
+                text=text,
+                tokens=[],
+                token_logprobs=[],
+                top_logprobs=None,
+                finish_reason="stop",
+                completion_tokens=comp_tok,
+            )
         )
 
-        lp = LogitsProcessorList()
-        if req.frequency_penalty or req.presence_penalty:
-            freq = float(req.frequency_penalty or 0.0)
-            pres = float(req.presence_penalty or 0.0)
-            lp.append(
-                FrequencyAndPresencePenaltyLogitsProcessor(
-                    presence_penalty=pres,
-                    frequency_penalty=freq,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-            )
-        if (req.frequency_penalty and req.frequency_penalty > 0) or (
-            req.presence_penalty and req.presence_penalty > 0
-        ):
-            lp.append(RepetitionPenaltyLogitsProcessor(penalty=1.05))
-        logits_processor = lp
-    except Exception:
-        logits_processor = None
-
-    # Seeding
-    generator = None
-    if req.seed is not None:
-        g = torch.Generator(device=device)
-        g.manual_seed(int(req.seed))
-        generator = g
-
-    # Tokenize batch (Harmony chat template when requested)
-    if getattr(req, "use_harmony", False):
-        conversations = []
-        sys_text = None
-        if req.system_prompt or req.reasoning:
-            parts = []
-            if req.reasoning:
-                parts.append(f"Reasoning: {req.reasoning}")
-            if req.system_prompt:
-                parts.append(req.system_prompt)
-            sys_text = "\n".join(parts).strip()
-        for p in prompts:
-            msgs = []
-            if sys_text:
-                msgs.append({"role": "system", "content": sys_text})
-            msgs.append({"role": "user", "content": p})
-            conversations.append(msgs)
-        enc = tokenizer.apply_chat_template(
-            conversations,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-            padding=True,
-            truncation=True,
-        ).to(model.device)
-    else:
-        enc = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        ).to(model.device)
-    prompt_lens = enc.attention_mask.sum(dim=1).tolist()
-
-    gen = model.generate(
-        **enc,
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
-        num_return_sequences=best_of,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.eos_token_id,
-        stopping_criteria=stopping,
-        logits_processor=logits_processor,
-        generator=generator,
-        output_scores=True,
-        return_dict_in_generate=True,
-    )
-
-    sequences = gen.sequences  # (B*best_of, total_len)
-    scores_per_step = gen.scores  # list length max_gen_steps
-    logprobs_steps = [torch.log_softmax(s, dim=-1) for s in scores_per_step]
-
-    B = len(prompts)
-    top_k = min(5, int(req.logprobs or 0)) if req.logprobs else 0
-
-    def row_index(b: int, k: int) -> int:
-        return b * best_of + k
-
-    all_choices: List[ChoiceOut] = []
-    prompt_token_total = sum(int(l) for l in prompt_lens)
-    completion_token_total = 0
-
-    # Harmony parser (optional)
-    harmony_enc = None
-    harmony_role = None
-    if getattr(req, "use_harmony", False):
-        try:
-            from openai_harmony import load_harmony_encoding, HarmonyEncodingName, Role  # type: ignore
-
-            harmony_enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-            harmony_role = Role.ASSISTANT
-        except Exception:
-            harmony_enc = None
-            harmony_role = None
-
-    for b in range(B):
-        p_len = int(prompt_lens[b])
-        prompt_ids = enc.input_ids[b].tolist()
-
-        cand_lp: List[List[float]] = []
-        cand_top: List[Optional[List[Optional[Dict[str, float]]]]] = []
-        cand_texts: List[str] = []
-        cand_gen_ids: List[List[int]] = []
-
-        for k in range(best_of):
-            r = row_index(b, k)
-            seq = sequences[r]
-            gen_ids = seq[p_len:]
-            token_ids = gen_ids.tolist()
-            if harmony_enc is not None and harmony_role is not None and getattr(req, "use_harmony", False):
-                try:
-                    msgs = harmony_enc.parse_messages_from_completion_tokens(token_ids, role=harmony_role)
-                    finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
-                    text = finals[-1].content if finals else tokenizer.decode(gen_ids, skip_special_tokens=True)
-                except Exception:
-                    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-            else:
-                text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-            stripped_text, _stopped = _strip_stop(text, stops)
-
-            # token logprobs for this row
-            row_lp = [float(logprobs_steps[t][r, token_ids[t]].item()) for t in range(len(token_ids))]
-
-            # top-k
-            if top_k > 0:
-                per_step: List[Dict[str, float]] = []
-                for t in range(len(token_ids)):
-                    lpv = logprobs_steps[t][r]
-                    vals, idx = torch.topk(lpv, k=top_k, dim=-1)
-                    toks = tokenizer.convert_ids_to_tokens(idx.tolist())
-                    per_step.append({toks[j]: float(vals[j].item()) for j in range(len(toks))})
-                cand_top.append(per_step)
-            else:
-                cand_top.append(None)
-
-            cand_lp.append(row_lp)
-            cand_texts.append(stripped_text)
-            cand_gen_ids.append(token_ids)
-
-        # Select top-n by mean logprob
-        means = [float(torch.tensor(lp).mean().item()) if len(lp) else float("-inf") for lp in cand_lp]
-        selected = sorted(range(len(means)), key=lambda i: means[i], reverse=True)[: n]
-
-        for k in selected:
-            gen_ids_list = cand_gen_ids[k]
-            tokens = tokenizer.convert_ids_to_tokens((prompt_ids + gen_ids_list) if req.echo else gen_ids_list)
-
-            if req.echo:
-                token_lp = [None] * len(prompt_ids) + [float(v) for v in cand_lp[k]]
-                top_lp = ([None] * len(prompt_ids) + cand_top[k]) if top_k > 0 and isinstance(cand_top[k], list) else None
-                text_out = prompts[b] + cand_texts[k]
-            else:
-                token_lp = [float(v) for v in cand_lp[k]]
-                top_lp = cand_top[k]
-                text_out = cand_texts[k]
-
-            finish_reason = "stop"
-            if len(gen_ids_list) >= max_new_tokens and (not stops):
-                finish_reason = "length"
-
-            all_choices.append(
-                ChoiceOut(
-                    text=text_out,
-                    tokens=tokens,
-                    token_logprobs=token_lp,
-                    top_logprobs=top_lp,
-                    finish_reason=finish_reason,
-                    completion_tokens=len(gen_ids_list),
-                )
-            )
-            completion_token_total += len(gen_ids_list)
-
     return GenerationResult(
-        choices=all_choices,
-        prompt_tokens=prompt_token_total,
-        completion_tokens=completion_token_total,
+        choices=choices,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
     )
