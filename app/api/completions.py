@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from app.core.config import system_fingerprint
 from app.schemas import CompletionsRequest, CompletionsResponse, CompletionChoice, Usage
 from app.core.auth import require_bearer_token
+from app.services.inference import generate_completions
 
 
 router = APIRouter()
@@ -25,18 +26,32 @@ async def create_completion(
         raise HTTPException(status_code=400, detail="model is required")
 
     created = int(time())
+    try:
+        gen = generate_completions(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    choices = [
+        CompletionChoice(
+            text=t,
+            index=i,
+            logprobs=None,
+            finish_reason=("length" if gen.reached_max else "stop"),
+        )
+        for i, t in enumerate(gen.texts)
+    ]
+
+    usage = Usage(
+        prompt_tokens=gen.prompt_tokens,
+        completion_tokens=gen.completion_tokens,
+        total_tokens=gen.prompt_tokens + gen.completion_tokens,
+    )
+
     return CompletionsResponse(
-        id=f"cmpl-stub-{created}",
+        id=f"cmpl-{created}",
         created=created,
         model=model,
         system_fingerprint=system_fingerprint(),
-        choices=[
-            CompletionChoice(
-                text="",
-                index=0,
-                logprobs=None,
-                finish_reason="not_implemented",
-            )
-        ],
-        usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        choices=choices,
+        usage=usage,
     )
