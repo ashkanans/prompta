@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 from app.schemas import CompletionsRequest, CompletionsResponse
 from app.services.inference import generate_completions
-from app.api.completions import _build_response  
+from app.core.response_builders import build_completions_response as _build_response
 from app.core.config import system_fingerprint  # ensures import side-effects are OK
 
 

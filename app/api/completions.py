@@ -14,44 +14,9 @@ from app.schemas import (
 from app.core.auth import require_bearer_token
 from app.services.inference import generate_completions
 from app.core.jobs import job_store, run_completion_job  # NEW
+from app.core.response_builders import build_completions_response as _build_response
 
 router = APIRouter()
-
-
-def _build_response(model: str, created: int, gen) -> CompletionsResponse:
-    choices = []
-    for i, c in enumerate(gen.choices):
-        lp = None
-        if c.tokens or c.token_logprobs or c.top_logprobs:
-            lp = LogProbs(
-                tokens=c.tokens,
-                token_logprobs=c.token_logprobs,
-                top_logprobs=c.top_logprobs,  # type: ignore
-                text_offset=None,
-            )
-        choices.append(
-            CompletionChoice(
-                text=c.text,
-                index=i,
-                logprobs=lp,
-                finish_reason=c.finish_reason,
-            )
-        )
-
-    usage = Usage(
-        prompt_tokens=gen.prompt_tokens,
-        completion_tokens=gen.completion_tokens,
-        total_tokens=gen.prompt_tokens + gen.completion_tokens,
-    )
-
-    return CompletionsResponse(
-        id=f"cmpl-{created}",
-        created=created,
-        model=model,
-        system_fingerprint=system_fingerprint(),
-        choices=choices,
-        usage=usage,
-    )
 
 
 @router.post("/v1/completions", tags=["completions"], response_model=CompletionsResponse)
