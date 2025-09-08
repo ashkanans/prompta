@@ -6,6 +6,7 @@ from app.core.logging import configure_logging
 from app.core.errors import register_exception_handlers
 from app.core.middleware import RequestContextMiddleware
 from app.api import health, batch, completions
+from fastapi.routing import APIRoute
 
 apply_environment(settings)
 configure_logging()
@@ -36,3 +37,15 @@ app.include_router(completions.router, prefix="")
 @app.get("/")
 async def root():
     return {"name": settings.APP_NAME, "version": settings.APP_VERSION}
+
+@app.get("/routes")
+async def list_routes():
+    route_list = []
+    for route in app.routes:
+        if isinstance(route, APIRoute):  # only include API routes, skip static/middleware
+            route_list.append({
+                "path": route.path,
+                "name": route.name,
+                "methods": list(route.methods)
+            })
+    return {"routes": route_list}
