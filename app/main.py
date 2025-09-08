@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings, apply_environment
 from app.core.logging import configure_logging
+from app.core.errors import register_exception_handlers
 from app.core.middleware import RequestContextMiddleware
 from app.api import health, batch, completions
 
@@ -10,10 +11,10 @@ apply_environment(settings)
 configure_logging()
 
 app = FastAPI(
-title=settings.APP_NAME,
-version=settings.APP_VERSION,
-docs_url="/docs" if settings.DEBUG else None,
-redoc_url="/redoc" if settings.DEBUG else None,
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    docs_url="/docs" if settings.DEBUG else None,
+    redoc_url="/redoc" if settings.DEBUG else None,
 )
 
 app.add_middleware(
@@ -25,6 +26,8 @@ allow_headers=["*"],
 )
 
 app.add_middleware(RequestContextMiddleware)
+
+register_exception_handlers(app)
 
 app.include_router(health.router, prefix="")
 app.include_router(batch.router, prefix="/batch", tags=["batch"])
