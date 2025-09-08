@@ -1,4 +1,5 @@
 from .completions import (
+    CompletionJob,
     CompletionsRequest,
     CompletionsResponse,
     CompletionChoice,
