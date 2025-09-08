@@ -54,39 +54,14 @@ def _choose_device() -> str:
 
 
 def _lazy_load():
-    global _MODEL_READY, _TOKENIZER, _MODEL
-    if _MODEL is not None and _TOKENIZER is not None:
-        return _TOKENIZER, _MODEL
-    with _LOAD_LOCK:
-        if _MODEL is not None and _TOKENIZER is not None:
-            return _TOKENIZER, _MODEL
-        device = _choose_device()
-        dtype = _parse_dtype(settings.TORCH_DTYPE)
-
-        _TOKENIZER = AutoTokenizer.from_pretrained(
-            settings.MODEL_ID,
-            use_fast=True,
-            trust_remote_code=True,
-        )
-        if (settings.DEVICE_MAP or "auto").lower() == "auto":
-            _MODEL = AutoModelForCausalLM.from_pretrained(
-                settings.MODEL_ID,
-                torch_dtype=dtype,  # None -> auto
-                device_map="auto",
-                trust_remote_code=True,
-            )
-        else:
-            _MODEL = AutoModelForCausalLM.from_pretrained(
-                settings.MODEL_ID,
-                torch_dtype=dtype,  # None -> auto
-                trust_remote_code=True,
-            )
-            _MODEL.to(device)
-        # Ensure pad token exists for generation APIs
-        if _TOKENIZER.pad_token_id is None and _TOKENIZER.eos_token_id is not None:
-            _TOKENIZER.pad_token = _TOKENIZER.eos_token
-        _MODEL_READY = True
-        return _TOKENIZER, _MODEL
+    model_id = current_model_id()
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype="auto",
+        device_map="cuda",
+    )
+    return tokenizer, model
 
 
 class StopOnSequences(StoppingCriteria):
