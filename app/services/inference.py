@@ -125,11 +125,7 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
     tokenizer, model = _lazy_load()
     device = _choose_device()
 
-    prompts: List[str]
-    if isinstance(req.prompt, list):
-        prompts = req.prompt
-    else:
-        prompts = [req.prompt]
+    prompts: List[str] = req.prompt if isinstance(req.prompt, list) else [req.prompt]
 
     # Prepare generation settings
     max_new_tokens = req.max_tokens or 16
@@ -151,7 +147,7 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
         if stops:
             stopping.append(StopOnSequences(tokenizer, stops))
 
-    # Penalties: approximate via repetition penalty; frequency/presence processors
+    # Penalties
     logits_processor = None
     try:
         from transformers.generation.logits_process import (  # type: ignore
@@ -164,15 +160,19 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
         if req.frequency_penalty or req.presence_penalty:
             freq = float(req.frequency_penalty or 0.0)
             pres = float(req.presence_penalty or 0.0)
-            lp.append(FrequencyAndPresencePenaltyLogitsProcessor(
-                presence_penalty=pres, frequency_penalty=freq, eos_token_id=tokenizer.eos_token_id
-            ))
-        # A mild repetition penalty if penalties suggest discouraging repeats
-        if (req.frequency_penalty and req.frequency_penalty > 0) or (req.presence_penalty and req.presence_penalty > 0):
+            lp.append(
+                FrequencyAndPresencePenaltyLogitsProcessor(
+                    presence_penalty=pres,
+                    frequency_penalty=freq,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            )
+        if (req.frequency_penalty and req.frequency_penalty > 0) or (
+            req.presence_penalty and req.presence_penalty > 0
+        ):
             lp.append(RepetitionPenaltyLogitsProcessor(penalty=1.05))
         logits_processor = lp
     except Exception:
-        # Fallback: no special processors
         logits_processor = None
 
     # Seeding
@@ -182,110 +182,113 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
         g.manual_seed(int(req.seed))
         generator = g
 
+    # Tokenize batch
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    ).to(model.device)
+    prompt_lens = enc.attention_mask.sum(dim=1).tolist()
+
+    gen = model.generate(
+        **enc,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        num_return_sequences=best_of,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.eos_token_id,
+        stopping_criteria=stopping,
+        logits_processor=logits_processor,
+        generator=generator,
+        output_scores=True,
+        return_dict_in_generate=True,
+    )
+
+    sequences = gen.sequences  # (B*best_of, total_len)
+    scores_per_step = gen.scores  # list length max_gen_steps
+    logprobs_steps = [torch.log_softmax(s, dim=-1) for s in scores_per_step]
+
+    B = len(prompts)
+    top_k = min(5, int(req.logprobs or 0)) if req.logprobs else 0
+
+    def row_index(b: int, k: int) -> int:
+        return b * best_of + k
+
     all_choices: List[ChoiceOut] = []
-    prompt_token_total = 0
+    prompt_token_total = sum(int(l) for l in prompt_lens)
     completion_token_total = 0
 
-    for prompt in prompts:
-        enc = tokenizer(prompt, return_tensors="pt")
-        input_ids = enc.input_ids.to(model.device)
-        prompt_len = input_ids.shape[-1]
-        gen = model.generate(
-            input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            num_return_sequences=best_of,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
-            stopping_criteria=stopping,
-            logits_processor=logits_processor,
-            generator=generator,
-            output_scores=True,
-            return_dict_in_generate=True,
-        )
+    for b in range(B):
+        p_len = int(prompt_lens[b])
+        prompt_ids = enc.input_ids[b].tolist()
 
-        # gen.sequences: (best_of, total_len), gen.scores: List[Tensor] length gen_len, each (best_of, vocab)
-        sequences = gen.sequences
-        gen_len = sequences.shape[-1] - prompt_len
-        scores_per_step = gen.scores  # list length gen_len
+        cand_lp: List[List[float]] = []
+        cand_top: List[Optional[List[Optional[Dict[str, float]]]]] = []
+        cand_texts: List[str] = []
+        cand_gen_ids: List[List[int]] = []
 
-        # Compute logprobs matrices [gen_len, best_of, vocab]
-        logprobs_steps = [torch.log_softmax(s, dim=-1) for s in scores_per_step]
+        for k in range(best_of):
+            r = row_index(b, k)
+            seq = sequences[r]
+            gen_ids = seq[p_len:]
+            token_ids = gen_ids.tolist()
+            text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            stripped_text, _stopped = _strip_stop(text, stops)
 
-        # For each sequence, collect sampled token ids and their logprobs
-        seq_token_ids = [sequences[i, prompt_len:].tolist() for i in range(sequences.shape[0])]
-        seq_token_logprobs = [
-            [float(logprobs_steps[t][i, tok_id].item()) for t, tok_id in enumerate(token_ids)]
-            for i, token_ids in enumerate(seq_token_ids)
-        ]
+            # token logprobs for this row
+            row_lp = [float(logprobs_steps[t][r, token_ids[t]].item()) for t in range(len(token_ids))]
 
-        # Prepare top-k per step if requested
-        top_k = min(5, int(req.logprobs or 0)) if req.logprobs else 0
-        seq_top_logprobs: List[Optional[List[Optional[Dict[str, float]]]]] = []
-        if top_k > 0:
-            for i in range(sequences.shape[0]):
+            # top-k
+            if top_k > 0:
                 per_step: List[Dict[str, float]] = []
-                for t in range(gen_len):
-                    lp = logprobs_steps[t][i]
-                    vals, idx = torch.topk(lp, k=top_k, dim=-1)
+                for t in range(len(token_ids)):
+                    lpv = logprobs_steps[t][r]
+                    vals, idx = torch.topk(lpv, k=top_k, dim=-1)
                     toks = tokenizer.convert_ids_to_tokens(idx.tolist())
                     per_step.append({toks[j]: float(vals[j].item()) for j in range(len(toks))})
-                seq_top_logprobs.append(per_step)
-        else:
-            seq_top_logprobs = [None for _ in range(sequences.shape[0])]
-
-        # Score sequences by mean token logprob for best_of selection
-        means = [float(torch.tensor(lp).mean().item()) if len(lp) > 0 else float("-inf") for lp in seq_token_logprobs]
-        # Select indices of top n sequences
-        selected_idx = sorted(range(len(means)), key=lambda i: means[i], reverse=True)[: n]
-
-        # Build choices for selected sequences
-        for rank, i_sel in enumerate(selected_idx):
-            seq = sequences[i_sel]
-            gen_ids = seq[prompt_len:]
-            text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-            stripped_text, stopped = _strip_stop(text, stops)
-
-            # Tokens array for echo or non-echo
-            prompt_ids = enc.input_ids[0].tolist()
-            combined_ids = (prompt_ids + gen_ids.tolist()) if req.echo else gen_ids.tolist()
-            tokens = tokenizer.convert_ids_to_tokens(combined_ids)
-
-            # Logprobs alignment: pad prompt part with None
-            token_lp: List[Optional[float]]
-            top_lp: Optional[List[Optional[Dict[str, float]]]]
-            if req.echo:
-                pad = [None] * len(prompt_ids)
-                token_lp = pad + [float(v) for v in seq_token_logprobs[i_sel]]
-                if top_k > 0 and isinstance(seq_top_logprobs[i_sel], list):
-                    top_lp = [None] * len(prompt_ids) + seq_top_logprobs[i_sel]  # type: ignore
-                else:
-                    top_lp = None
+                cand_top.append(per_step)
             else:
-                token_lp = [float(v) for v in seq_token_logprobs[i_sel]]
-                top_lp = seq_top_logprobs[i_sel]
+                cand_top.append(None)
 
-            finish_reason = "length"
-            if stopped or (gen_ids.shape[0] < max_new_tokens) or (
-                gen_ids.shape[0] == max_new_tokens and int(gen_ids[-1].item()) == tokenizer.eos_token_id
-            ):
-                finish_reason = "stop"
+            cand_lp.append(row_lp)
+            cand_texts.append(stripped_text)
+            cand_gen_ids.append(token_ids)
 
-            choice = ChoiceOut(
-                text=(prompt + stripped_text) if req.echo else stripped_text,
-                tokens=tokens,
-                token_logprobs=token_lp,
-                top_logprobs=top_lp,
-                finish_reason=finish_reason,
-                completion_tokens=int(gen_ids.shape[0]),
+        # Select top-n by mean logprob
+        means = [float(torch.tensor(lp).mean().item()) if len(lp) else float("-inf") for lp in cand_lp]
+        selected = sorted(range(len(means)), key=lambda i: means[i], reverse=True)[: n]
+
+        for k in selected:
+            gen_ids_list = cand_gen_ids[k]
+            tokens = tokenizer.convert_ids_to_tokens((prompt_ids + gen_ids_list) if req.echo else gen_ids_list)
+
+            if req.echo:
+                token_lp = [None] * len(prompt_ids) + [float(v) for v in cand_lp[k]]
+                top_lp = ([None] * len(prompt_ids) + cand_top[k]) if top_k > 0 and isinstance(cand_top[k], list) else None
+                text_out = prompts[b] + cand_texts[k]
+            else:
+                token_lp = [float(v) for v in cand_lp[k]]
+                top_lp = cand_top[k]
+                text_out = cand_texts[k]
+
+            finish_reason = "stop"
+            if len(gen_ids_list) >= max_new_tokens and (not stops):
+                finish_reason = "length"
+
+            all_choices.append(
+                ChoiceOut(
+                    text=text_out,
+                    tokens=tokens,
+                    token_logprobs=token_lp,
+                    top_logprobs=top_lp,
+                    finish_reason=finish_reason,
+                    completion_tokens=len(gen_ids_list),
+                )
             )
-            all_choices.append(choice)
-
-        prompt_token_total += int(prompt_len)
-        # Count completion tokens only for selected sequences
-        completion_token_total += sum(c.completion_tokens for c in all_choices[-len(selected_idx) :])
+            completion_token_total += len(gen_ids_list)
 
     return GenerationResult(
         choices=all_choices,
