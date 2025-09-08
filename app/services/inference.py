@@ -5,49 +5,31 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from app.core.config import settings
 from app.schemas import CompletionsRequest
 
+# Load model exactly as requested
+model_id = "openai/gpt-oss-20b"
 
-# Minimal, single-path inference service using HF + Harmony
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype="auto",
+    device_map="cuda",
+)
+print("Loaded:", model_id, "on", torch.cuda.get_device_name(0))
 
-_tokenizer = None
-_model = None
-
-
-def _load_model_once():
-    global _tokenizer, _model
-    if _tokenizer is None or _model is None:
-        model_id = settings.MODEL_ID
-        _tokenizer = AutoTokenizer.from_pretrained(model_id)
-        _model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype="auto",
-            device_map="cuda",
-        )
-        try:
-            print("Loaded:", model_id, "on", torch.cuda.get_device_name(0))
-        except Exception:
-            print("Loaded:", model_id)
-    return _tokenizer, _model
-
-
-def is_model_ready() -> bool:
-    tok, mdl = _tokenizer, _model
-    return tok is not None and mdl is not None
-
-
-# Harmony encoding
+# Harmony
 from openai_harmony import load_harmony_encoding, HarmonyEncodingName, Role  # type: ignore
 
 enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
+# Global system prompt for single-sample complete (as per exact call)
+system_prompt = ""
 
-def complete(prompt: str, system_prompt: str = "", max_new_tokens: int = 256, reasoning: str = "medium", temperature: float = 0.7) -> str:
-    tokenizer, model = _load_model_once()
 
+def complete(prompt: str, max_new_tokens=256, reasoning="medium", temperature=0.7):
     messages = [
         {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
         {"role": "user", "content": prompt},
@@ -80,13 +62,12 @@ def complete_batch(
     max_new_tokens: int = 256,
     reasoning: str = "medium",
     temperature: float = 0.7,
-) -> List[str]:
+):
     """
     prompts: list of (system_prompt, user_prompt)
     returns: list[str] model outputs, one per input pair
     """
-    tokenizer, model = _load_model_once()
-
+    # Build a batch of conversations
     conversations = [
         [
             {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
@@ -95,28 +76,29 @@ def complete_batch(
         for system_prompt, user_prompt in prompts
     ]
 
+    # Tokenize as a batch
     inputs = tokenizer.apply_chat_template(
         conversations,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
         padding=True,
-        truncation=True,
+        truncation=True,  # optional but safer
     ).to(model.device)
 
     with torch.no_grad():
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         generated = model.generate(
             **inputs,
             do_sample=True,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
-            pad_token_id=pad_id,
+            pad_token_id=tokenizer.pad_token_id,
         )
 
+    # Slice out each sample’s newly generated tokens
     input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
 
-    outputs: List[str] = []
+    outputs = []
     for i, in_len in enumerate(input_lengths):
         new_tokens = generated[i, in_len:].tolist()
         msgs = enc.parse_messages_from_completion_tokens(new_tokens, role=Role.ASSISTANT)
@@ -162,8 +144,6 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
     t1 = time.time()
     _ = (t0, t1)  # kept for clarity; times can be logged if needed
 
-    tokenizer, _model_ref = _load_model_once()
-
     choices: List[ChoiceOut] = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
@@ -207,3 +187,8 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
     )
+
+
+def is_model_ready() -> bool:
+    # Model and tokenizer are loaded at import time in this flow
+    return True
