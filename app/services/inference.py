@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple, Any
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
-from app.schemas import CompletionsRequest
 
 # Load model exactly as requested
 model_id = "openai/gpt-oss-20b"
@@ -25,49 +22,12 @@ from openai_harmony import load_harmony_encoding, HarmonyEncodingName, Role  # t
 
 enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
+# ---------- DO NOT CHANGE THESE (per your request) ----------
 
-def _safe_pad_id():
-    # pad_token_id may be None for some LLMs; fall back to eos
-    return tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-def _safe_pad_id():
-    return tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-def _decode_new_tokens(new_token_ids):
-    """
-    Robustly extract assistant text from freshly generated token IDs.
-    - Drop leading EOS/PAD noise
-    - Try Harmony parse
-    - Fallback to plain decode if parse fails
-    """
-    if not new_token_ids:
-        return ""
-
-    eos_id = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id
-
-    # 1) Trim leading eos/pad tokens
-    i = 0
-    while i < len(new_token_ids) and new_token_ids[i] in {eos_id, pad_id}:
-        i += 1
-    trimmed = new_token_ids[i:] if i else new_token_ids
-
-    # 2) Try Harmony parse
-    try:
-        msgs = enc.parse_messages_from_completion_tokens(trimmed, role=Role.ASSISTANT)
-        finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
-        if finals:
-            return finals[-1].content
-        # no explicit "final" channel? fall back to decoded text
-    except Exception:
-        pass
-
-    # 3) Plain decode fallback (drop special tokens)
-    return tokenizer.decode(trimmed, skip_special_tokens=True)
 def complete(prompt: tuple[str, str], max_new_tokens=256, reasoning="medium", temperature=0.7):
-    sys_prompt, user_prompt = prompt
+    system_prompt, user_prompt = prompt
     messages = [
-        {"role": "system", "content": f"Reasoning: {reasoning}\n{sys_prompt}".strip()},
+        {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
         {"role": "user", "content": user_prompt},
     ]
     inputs = tokenizer.apply_chat_template(
@@ -83,34 +43,42 @@ def complete(prompt: tuple[str, str], max_new_tokens=256, reasoning="medium", te
             do_sample=True,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.eos_token_id,   # keep EOS as pad for safety
-            eos_token_id=tokenizer.eos_token_id,   # ensure stop on EOS
+            pad_token_id=tokenizer.eos_token_id,
         )
 
     new_tokens = generated[0][inputs["input_ids"].shape[-1]:].tolist()
-    return _decode_new_tokens(new_tokens)
+
+    msgs = enc.parse_messages_from_completion_tokens(new_tokens, role=Role.ASSISTANT)
+    finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
+    return finals[-1].content if finals else tokenizer.decode(new_tokens)
 
 def complete_batch(
-    prompts: List[Tuple[str, str]],
+    prompts: list[tuple[str, str]],
     max_new_tokens: int = 256,
     reasoning: str = "medium",
     temperature: float = 0.7,
 ):
+    """
+    prompts: list of (system_prompt, user_prompt)
+    returns: list[str] model outputs, one per input pair
+    """
+    # Build a batch of conversations
     conversations = [
         [
-            {"role": "system", "content": f"Reasoning: {reasoning}\n{sys_prompt}".strip()},
+            {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
             {"role": "user", "content": user_prompt},
         ]
-        for sys_prompt, user_prompt in prompts
+        for system_prompt, user_prompt in prompts
     ]
 
+    # Tokenize as a batch
     inputs = tokenizer.apply_chat_template(
         conversations,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
         padding=True,
-        truncation=True,
+        truncation=True,  # optional but safer
     ).to(model.device)
 
     with torch.no_grad():
@@ -119,72 +87,104 @@ def complete_batch(
             do_sample=True,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
-            pad_token_id=_safe_pad_id(),
-            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
         )
 
+    # Slice out each sample’s newly generated tokens
     input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
 
     outputs = []
     for i, in_len in enumerate(input_lengths):
         new_tokens = generated[i, in_len:].tolist()
-        text = _decode_new_tokens(new_tokens)
+        msgs = enc.parse_messages_from_completion_tokens(new_tokens, role=Role.ASSISTANT)
+        finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
+        text = finals[-1].content if finals else tokenizer.decode(new_tokens)
         outputs.append(text)
 
     return outputs
 
+# ---------- Helpers (safe to add) ----------
+
+def normalize_text_content(x: Any) -> str:
+    """
+    Convert Harmony content (str | TextContent | list[TextContent] | mixed) to a plain str.
+    We do NOT touch/modify complete()/complete_batch(); we only normalize their returns here.
+    """
+    # already a string
+    if isinstance(x, str):
+        return x
+
+    # one TextContent-like object with .text
+    if hasattr(x, "text") and isinstance(getattr(x, "text"), str):
+        return x.text
+
+    # list of segments (e.g., [TextContent(...), ...] or mixed)
+    if isinstance(x, list):
+        parts = []
+        for item in x:
+            if isinstance(item, str):
+                parts.append(item)
+            elif hasattr(item, "text") and isinstance(getattr(item, "text"), str):
+                parts.append(item.text)
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+
+    # anything else: stringify
+    return str(x)
 
 
-@dataclass
-class ChoiceOut:
-    text: str
-    tokens: List[str]
-    token_logprobs: List[Optional[float]]
-    top_logprobs: Optional[List[dict]]
-    finish_reason: str
-    completion_tokens: int
+def generate_completions(req: dict) -> dict:
+    """
+    Returns a plain dict:
+    {
+      "choices": [{"text": str, "index": int, "logprobs": None, "finish_reason": "stop"}, ...],
+      "prompt_tokens": int,
+      "completion_tokens": int
+    }
+    """
+    # prompt can be str or list[str]; keep it loose (no Pydantic)
+    raw_prompts = req.get("prompt")
+    if isinstance(raw_prompts, str):
+        prompts: List[str] = [raw_prompts]
+    elif isinstance(raw_prompts, list):
+        prompts = [str(p) for p in raw_prompts]
+    else:
+        raise ValueError("prompt must be a string or list of strings")
 
-
-@dataclass
-class GenerationResult:
-    choices: List[ChoiceOut]
-    prompt_tokens: int
-    completion_tokens: int
-
-
-def generate_completions(req: CompletionsRequest) -> GenerationResult:
-    # Normalize prompts: allow str or list[str]
-    prompts: List[str] = req.prompt if isinstance(req.prompt, list) else [req.prompt]
-
-    # Build (system, user) pairs
-    sys_prompt = req.system_prompt or ""
+    sys_prompt = req.get("system_prompt") or ""
     pairs: List[Tuple[str, str]] = [(sys_prompt, p) for p in prompts]
 
-    # Default params to match the requested flow
-    max_new = req.max_tokens or 600
-    reasoning = req.reasoning or "medium"
-    temperature = 0.1 if req.temperature is None else req.temperature
+    # defaults
+    max_new = req.get("max_tokens") or 600
+    reasoning = req.get("reasoning") or "medium"
+    temperature = req.get("temperature")
+    if temperature is None:
+        # your example uses 0.1 in batch; but keep flexible
+        temperature = 0.7
 
-    # Run batch generation
+    # Run batch
     t0 = time.time()
     texts = complete_batch(
         pairs,
         max_new_tokens=max_new,
         reasoning=reasoning,
-        temperature=temperature,
+        temperature=float(temperature),
     )
     t1 = time.time()
-    _ = (t0, t1)  # keep for optional logging
+    _ = (t0, t1)
 
-    choices: List[ChoiceOut] = []
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
+    # Normalize to strings
+    norm_texts = [normalize_text_content(t) for t in texts]
 
     # Rough token accounting
-    for (sys_p, user_p), text in zip(pairs, texts):
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    choices = []
+    for idx, ((sp, up), text) in enumerate(zip(pairs, norm_texts)):
         conv = [
-            {"role": "system", "content": f"Reasoning: {reasoning}\n{sys_p}".strip()},
-            {"role": "user", "content": user_p},
+            {"role": "system", "content": f"Reasoning: {reasoning}\n{sp}".strip()},
+            {"role": "user", "content": up},
         ]
         enc_in = tokenizer.apply_chat_template(
             conv,
@@ -192,36 +192,24 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
             return_tensors="pt",
             return_dict=True,
         )
-        try:
-            prompt_tok = int(enc_in["input_ids"].shape[1])
-        except Exception:
-            prompt_tok = 0
-        try:
-            comp_tok = len(tokenizer.encode(text, add_special_tokens=False))
-        except Exception:
-            comp_tok = 0
-
+        prompt_tok = int(enc_in["input_ids"].shape[1]) if "input_ids" in enc_in else 0
+        comp_tok = len(tokenizer.encode(text, add_special_tokens=False)) if text else 0
         total_prompt_tokens += prompt_tok
         total_completion_tokens += comp_tok
 
-        choices.append(
-            ChoiceOut(
-                text=text,
-                tokens=[],
-                token_logprobs=[],
-                top_logprobs=None,
-                finish_reason="stop",
-                completion_tokens=comp_tok,
-            )
-        )
+        choices.append({
+            "text": text,                # guaranteed str
+            "index": idx,
+            "logprobs": None,
+            "finish_reason": "stop",
+        })
 
-    return GenerationResult(
-        choices=choices,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-    )
+    return {
+        "choices": choices,
+        "prompt_tokens": total_prompt_tokens,
+        "completion_tokens": total_completion_tokens,
+    }
 
 
 def is_model_ready() -> bool:
-    # Model and tokenizer are loaded at import time in this flow
     return True

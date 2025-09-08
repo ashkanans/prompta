@@ -3,11 +3,8 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
-from app.schemas import CompletionsRequest, CompletionsResponse
 from app.services.inference import generate_completions
-from app.core.response_builders import build_completions_response as _build_response
-from app.core.config import system_fingerprint  # ensures import side-effects are OK
-
+from app.core.response_builders import build_completions_response_dict
 
 class _Job:
     def __init__(self, payload: Dict[str, Any]):
@@ -18,7 +15,6 @@ class _Job:
         self.payload = payload
         self.result: Optional[Dict[str, Any]] = None
         self.error: Optional[str] = None
-
 
 class _JobStore:
     def __init__(self):
@@ -54,28 +50,20 @@ class _JobStore:
             j.error = error
             j.updated = int(time.time())
 
-
 job_store = _JobStore()
 
-
 def run_completion_job(job_id: str):
-    """
-    Background task entrypoint: executes the generation and stores the result.
-    """
     job = job_store.get(job_id)
     if not job:
-        return  # nothing to do
-
+        return
     try:
         job_store.set_running(job_id)
+        req = dict(job.payload)
+        model = req.get("model", "openai/gpt-oss-20b")
 
-        req = CompletionsRequest(**job.payload)
         gen = generate_completions(req)
+        response = build_completions_response_dict(model, gen)
 
-        created = int(time.time())
-        response = _build_response(req.model, created, gen)
-
-        # Persist the exact response shape for easy retrieval
-        job_store.set_succeeded(job_id, response.model_dump())
+        job_store.set_succeeded(job_id, response)
     except Exception as e:
         job_store.set_failed(job_id, str(e))
