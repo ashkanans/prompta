@@ -5,3 +5,4 @@ from .completions import (
     LogProbs,
     Usage,
 )
+from .batch import BatchCompletionsRequest, BatchCompletionsResponse
