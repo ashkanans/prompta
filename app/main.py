@@ -34,8 +34,8 @@ app.include_router(health.router, prefix="")
 app.include_router(batch.router, prefix="/batch", tags=["batch"])
 app.include_router(completions.router, prefix="")
 
-@app.get("/routes")
-async def list_routes():
+@app.get("/")
+async def root():
     route_list = []
     for route in app.routes:
         if isinstance(route, APIRoute):  # only include API routes, skip static/middleware
@@ -44,9 +44,6 @@ async def list_routes():
                 "name": route.name,
                 "methods": list(route.methods)
             })
-    return {"routes": route_list}
 
-@app.get("/")
-async def root():
-    return {"name": settings.APP_NAME, "version": settings.APP_VERSION}
+    return {"name": settings.APP_NAME, "version": settings.APP_VERSION, "routes": route_list}
 
