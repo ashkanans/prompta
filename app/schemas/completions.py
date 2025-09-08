@@ -39,6 +39,11 @@ class CompletionsRequest(BaseModel):
     user: Optional[str] = None
     logit_bias: Optional[Dict[Union[str, int], float]] = None
 
+    # GPT-OSS/Harmony-specific optional inputs
+    use_harmony: Optional[bool] = None
+    reasoning: Optional[str] = "medium"
+    system_prompt: Optional[str] = None
+
     @field_validator("prompt", mode="before")
     @classmethod
     def coerce_prompt(cls, v: PromptType):
@@ -162,6 +167,9 @@ class CompletionsRequest(BaseModel):
         if isinstance(self.prompt, list) and self.n not in (None, 1):
             # For now, restrict: multi-prompt + n>1 expansion not supported in this backend
             pass
+        # Default Harmony behavior for GPT-OSS models
+        if self.use_harmony is None:
+            self.use_harmony = "gpt-oss" in (self.model or "").lower()
         return self
 
 

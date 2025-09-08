@@ -191,13 +191,38 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
         g.manual_seed(int(req.seed))
         generator = g
 
-    # Tokenize batch
-    enc = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    ).to(model.device)
+    # Tokenize batch (Harmony chat template when requested)
+    if getattr(req, "use_harmony", False):
+        conversations = []
+        sys_text = None
+        if req.system_prompt or req.reasoning:
+            parts = []
+            if req.reasoning:
+                parts.append(f"Reasoning: {req.reasoning}")
+            if req.system_prompt:
+                parts.append(req.system_prompt)
+            sys_text = "\n".join(parts).strip()
+        for p in prompts:
+            msgs = []
+            if sys_text:
+                msgs.append({"role": "system", "content": sys_text})
+            msgs.append({"role": "user", "content": p})
+            conversations.append(msgs)
+        enc = tokenizer.apply_chat_template(
+            conversations,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+            padding=True,
+            truncation=True,
+        ).to(model.device)
+    else:
+        enc = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(model.device)
     prompt_lens = enc.attention_mask.sum(dim=1).tolist()
 
     gen = model.generate(
@@ -230,6 +255,19 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
     prompt_token_total = sum(int(l) for l in prompt_lens)
     completion_token_total = 0
 
+    # Harmony parser (optional)
+    harmony_enc = None
+    harmony_role = None
+    if getattr(req, "use_harmony", False):
+        try:
+            from openai_harmony import load_harmony_encoding, HarmonyEncodingName, Role  # type: ignore
+
+            harmony_enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+            harmony_role = Role.ASSISTANT
+        except Exception:
+            harmony_enc = None
+            harmony_role = None
+
     for b in range(B):
         p_len = int(prompt_lens[b])
         prompt_ids = enc.input_ids[b].tolist()
@@ -244,7 +282,15 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
             seq = sequences[r]
             gen_ids = seq[p_len:]
             token_ids = gen_ids.tolist()
-            text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            if harmony_enc is not None and harmony_role is not None and getattr(req, "use_harmony", False):
+                try:
+                    msgs = harmony_enc.parse_messages_from_completion_tokens(token_ids, role=harmony_role)
+                    finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
+                    text = finals[-1].content if finals else tokenizer.decode(gen_ids, skip_special_tokens=True)
+                except Exception:
+                    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            else:
+                text = tokenizer.decode(gen_ids, skip_special_tokens=True)
             stripped_text, _stopped = _strip_stop(text, stops)
 
             # token logprobs for this row
