@@ -30,7 +30,40 @@ def _safe_pad_id():
     # pad_token_id may be None for some LLMs; fall back to eos
     return tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
+def _safe_pad_id():
+    return tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
+def _decode_new_tokens(new_token_ids):
+    """
+    Robustly extract assistant text from freshly generated token IDs.
+    - Drop leading EOS/PAD noise
+    - Try Harmony parse
+    - Fallback to plain decode if parse fails
+    """
+    if not new_token_ids:
+        return ""
+
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id
+
+    # 1) Trim leading eos/pad tokens
+    i = 0
+    while i < len(new_token_ids) and new_token_ids[i] in {eos_id, pad_id}:
+        i += 1
+    trimmed = new_token_ids[i:] if i else new_token_ids
+
+    # 2) Try Harmony parse
+    try:
+        msgs = enc.parse_messages_from_completion_tokens(trimmed, role=Role.ASSISTANT)
+        finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
+        if finals:
+            return finals[-1].content
+        # no explicit "final" channel? fall back to decoded text
+    except Exception:
+        pass
+
+    # 3) Plain decode fallback (drop special tokens)
+    return tokenizer.decode(trimmed, skip_special_tokens=True)
 def complete(prompt: tuple[str, str], max_new_tokens=256, reasoning="medium", temperature=0.7):
     sys_prompt, user_prompt = prompt
     messages = [
@@ -50,15 +83,12 @@ def complete(prompt: tuple[str, str], max_new_tokens=256, reasoning="medium", te
             do_sample=True,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,   # keep EOS as pad for safety
+            eos_token_id=tokenizer.eos_token_id,   # ensure stop on EOS
         )
 
     new_tokens = generated[0][inputs["input_ids"].shape[-1]:].tolist()
-
-    msgs = enc.parse_messages_from_completion_tokens(new_tokens, role=Role.ASSISTANT)
-    finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
-    return finals[-1].content if finals else tokenizer.decode(new_tokens)
-
+    return _decode_new_tokens(new_tokens)
 
 def complete_batch(
     prompts: List[Tuple[str, str]],
@@ -66,10 +96,6 @@ def complete_batch(
     reasoning: str = "medium",
     temperature: float = 0.7,
 ):
-    """
-    prompts: list of (system_prompt, user_prompt)
-    returns: list[str] model outputs, one per input pair
-    """
     conversations = [
         [
             {"role": "system", "content": f"Reasoning: {reasoning}\n{sys_prompt}".strip()},
@@ -94,20 +120,19 @@ def complete_batch(
             temperature=temperature,
             max_new_tokens=max_new_tokens,
             pad_token_id=_safe_pad_id(),
+            eos_token_id=tokenizer.eos_token_id,
         )
 
-    # Slice out each sample’s newly generated tokens
     input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
 
     outputs = []
     for i, in_len in enumerate(input_lengths):
         new_tokens = generated[i, in_len:].tolist()
-        msgs = enc.parse_messages_from_completion_tokens(new_tokens, role=Role.ASSISTANT)
-        finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
-        text = finals[-1].content if finals else tokenizer.decode(new_tokens)
+        text = _decode_new_tokens(new_tokens)
         outputs.append(text)
 
     return outputs
+
 
 
 @dataclass
