@@ -1,16 +1,19 @@
 from time import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 
 from app.core.config import system_fingerprint
 from app.schemas import CompletionsRequest, CompletionsResponse, CompletionChoice, Usage
+from app.core.auth import require_bearer_token
 
 
 router = APIRouter()
 
 
 @router.post("/v1/completions", tags=["completions"], response_model=CompletionsResponse)
-async def create_completion(payload: CompletionsRequest) -> CompletionsResponse:
+async def create_completion(
+    payload: CompletionsRequest, _auth: str | None = Depends(require_bearer_token)
+) -> CompletionsResponse:
     """OpenAI-compatible legacy Completions endpoint (scaffold).
 
     This is a stub that returns a syntactically compatible response. Full
