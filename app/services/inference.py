@@ -105,12 +105,13 @@ def complete_batch(
     ).to(model.device)
 
     with torch.no_grad():
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         generated = model.generate(
             **inputs,
             do_sample=True,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
+            pad_token_id=pad_id,
         )
 
     input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
@@ -173,9 +174,20 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
             {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
             {"role": "user", "content": user_prompt},
         ]
-        enc_in = tokenizer.apply_chat_template(conv, add_generation_prompt=True, return_tensors="pt")
-        prompt_tok = int(enc_in.shape[-1]) if hasattr(enc_in, "shape") else len(enc_in[0])  # type: ignore
-        comp_tok = len(tokenizer.encode(text))
+        enc_in = tokenizer.apply_chat_template(
+            conv,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        try:
+            prompt_tok = int(enc_in["input_ids"].shape[1])
+        except Exception:
+            prompt_tok = 0
+        try:
+            comp_tok = len(tokenizer.encode(text, add_special_tokens=False))
+        except Exception:
+            comp_tok = 0
         total_prompt_tokens += prompt_tok
         total_completion_tokens += comp_tok
 
