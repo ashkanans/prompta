@@ -12,13 +12,11 @@ StopType = Union[str, List[str]]
 
 
 class StreamOptions(BaseModel):
-    # Placeholder for future fields; accept arbitrary extra for forward-compat
     class Config:
         extra = "allow"
 
 
 class CompletionsRequest(BaseModel):
-    # Default to configured model if omitted
     model: str = Field(default_factory=lambda: settings.MODEL_ID)
     prompt: PromptType
 
@@ -51,9 +49,7 @@ class CompletionsRequest(BaseModel):
             return v
         if isinstance(v, list):
             if len(v) == 1:
-                # normalize single-item list to str
                 return v[0]
-            # keep as list[str]
             if not all(isinstance(x, str) for x in v):
                 raise ValueError("prompt list must contain only strings")
             return v
@@ -144,7 +140,6 @@ class CompletionsRequest(BaseModel):
             return None
         if not isinstance(v, dict):
             raise ValueError("logit_bias must be a mapping")
-        # normalize keys to str token ids; values to float
         norm: Dict[str, float] = {}
         for k, val in v.items():
             key = str(k)
@@ -165,9 +160,7 @@ class CompletionsRequest(BaseModel):
         if self.stream and self.best_of not in (None, 1):
             raise ValueError("streaming is not supported with best_of > 1")
         if isinstance(self.prompt, list) and self.n not in (None, 1):
-            # For now, restrict: multi-prompt + n>1 expansion not supported in this backend
             pass
-        # Default Harmony behavior for GPT-OSS models
         if self.use_harmony is None:
             self.use_harmony = "gpt-oss" in (self.model or "").lower()
         return self
@@ -201,3 +194,15 @@ class CompletionsResponse(BaseModel):
     system_fingerprint: Optional[str] = None
     choices: List[CompletionChoice]
     usage: Usage
+
+
+# --------- Job (async) envelope ---------
+
+class CompletionJob(BaseModel):
+    id: str
+    object: Literal["completion.job"] = Field(default="completion.job")
+    created: int
+    status: Literal["queued", "running", "succeeded", "failed"]
+    # When finished, the exact CompletionsResponse payload goes here
+    result: Optional[CompletionsResponse] = None
+    error: Optional[str] = None

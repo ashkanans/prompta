@@ -25,14 +25,17 @@ from openai_harmony import load_harmony_encoding, HarmonyEncodingName, Role  # t
 
 enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
-# Global system prompt for single-sample complete (as per exact call)
-system_prompt = ""
+
+def _safe_pad_id():
+    # pad_token_id may be None for some LLMs; fall back to eos
+    return tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
 
-def complete(prompt: str, max_new_tokens=256, reasoning="medium", temperature=0.7):
+def complete(prompt: tuple[str, str], max_new_tokens=256, reasoning="medium", temperature=0.7):
+    sys_prompt, user_prompt = prompt
     messages = [
-        {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
-        {"role": "user", "content": prompt},
+        {"role": "system", "content": f"Reasoning: {reasoning}\n{sys_prompt}".strip()},
+        {"role": "user", "content": user_prompt},
     ]
     inputs = tokenizer.apply_chat_template(
         messages,
@@ -67,23 +70,21 @@ def complete_batch(
     prompts: list of (system_prompt, user_prompt)
     returns: list[str] model outputs, one per input pair
     """
-    # Build a batch of conversations
     conversations = [
         [
-            {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
+            {"role": "system", "content": f"Reasoning: {reasoning}\n{sys_prompt}".strip()},
             {"role": "user", "content": user_prompt},
         ]
-        for system_prompt, user_prompt in prompts
+        for sys_prompt, user_prompt in prompts
     ]
 
-    # Tokenize as a batch
     inputs = tokenizer.apply_chat_template(
         conversations,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
         padding=True,
-        truncation=True,  # optional but safer
+        truncation=True,
     ).to(model.device)
 
     with torch.no_grad():
@@ -92,7 +93,7 @@ def complete_batch(
             do_sample=True,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
+            pad_token_id=_safe_pad_id(),
         )
 
     # Slice out each sample’s newly generated tokens
@@ -127,32 +128,38 @@ class GenerationResult:
 
 
 def generate_completions(req: CompletionsRequest) -> GenerationResult:
-    # Normalize input to a list of prompts
+    # Normalize prompts: allow str or list[str]
     prompts: List[str] = req.prompt if isinstance(req.prompt, list) else [req.prompt]
 
     # Build (system, user) pairs
-    sys = req.system_prompt or ""
-    pairs: List[Tuple[str, str]] = [(sys, p) for p in prompts]
+    sys_prompt = req.system_prompt or ""
+    pairs: List[Tuple[str, str]] = [(sys_prompt, p) for p in prompts]
 
     # Default params to match the requested flow
     max_new = req.max_tokens or 600
     reasoning = req.reasoning or "medium"
     temperature = 0.1 if req.temperature is None else req.temperature
 
+    # Run batch generation
     t0 = time.time()
-    texts = complete_batch(pairs, max_new_tokens=max_new, reasoning=reasoning, temperature=temperature)
+    texts = complete_batch(
+        pairs,
+        max_new_tokens=max_new,
+        reasoning=reasoning,
+        temperature=temperature,
+    )
     t1 = time.time()
-    _ = (t0, t1)  # kept for clarity; times can be logged if needed
+    _ = (t0, t1)  # keep for optional logging
 
     choices: List[ChoiceOut] = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    # Rough token accounting: chat template for prompt; plain encode for output
-    for (system_prompt, user_prompt), text in zip(pairs, texts):
+    # Rough token accounting
+    for (sys_p, user_p), text in zip(pairs, texts):
         conv = [
-            {"role": "system", "content": f"Reasoning: {reasoning}\n{system_prompt}".strip()},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": f"Reasoning: {reasoning}\n{sys_p}".strip()},
+            {"role": "user", "content": user_p},
         ]
         enc_in = tokenizer.apply_chat_template(
             conv,
@@ -168,6 +175,7 @@ def generate_completions(req: CompletionsRequest) -> GenerationResult:
             comp_tok = len(tokenizer.encode(text, add_special_tokens=False))
         except Exception:
             comp_tok = 0
+
         total_prompt_tokens += prompt_tok
         total_completion_tokens += comp_tok
 
