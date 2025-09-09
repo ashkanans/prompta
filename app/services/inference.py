@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from typing import List, Tuple
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import re
 
 # Load model exactly as requested
 model_id = "openai/gpt-oss-20b"
@@ -62,16 +63,29 @@ def complete_batch(
     # Slice out each sample’s newly generated tokens
     input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
 
-    outputs: List[str] = []
-    for i, in_len in enumerate(input_lengths):
-        new_tokens = generated[i, in_len:].tolist()
-        # Try Harmony parse; fallback to plain decode if parsing fails
-        try:
-            msgs = enc.parse_messages_from_completion_tokens(new_tokens, role=Role.ASSISTANT)
-            finals = [m for m in msgs if getattr(m, "channel", "final") == "final"]
-            text = finals[-1].content if finals else tokenizer.decode(new_tokens)
-        except Exception:
-            text = tokenizer.decode(new_tokens)
-        outputs.append(text)
+    def extract_final(text: str) -> str:
+        """
+        Return only the final assistant message, discarding analysis/channel markup.
+        Prefer the last occurrence of assistant message markers.
+        """
+        # Find the last assistant chunk
+        pattern = r"(?:assistantfinal|<\|channel\|>final|<\|message\|>)(.*?)(?:(?:<\|return\|>|<\|end\|>|<\|channel\|>|\Z))"
+        matches = list(re.finditer(pattern, text, re.S))
+        if matches:
+            chunk = matches[-1].group(1)
+        else:
+            # Fallback: try to grab the last line containing '||'
+            lines_with_sep = [ln for ln in text.splitlines() if "||" in ln]
+            chunk = lines_with_sep[-1] if lines_with_sep else text
 
-    return outputs
+        # Remove any leftover <|...|> tags and trim
+        chunk = re.sub(r"<\|.*?\|>", "", chunk)
+        return chunk.strip()
+
+    results = []
+    for i, in_len in enumerate(input_lengths):
+        new_tokens = generated[i, in_len:]
+        decoded = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        results.append(extract_final(decoded))
+
+    print(results)  
