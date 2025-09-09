@@ -88,4 +88,4 @@ def complete_batch(
         decoded = tokenizer.decode(new_tokens, skip_special_tokens=False)
         results.append(extract_final(decoded))
 
-    print(results)  
+    return results
