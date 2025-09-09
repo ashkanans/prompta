@@ -93,8 +93,8 @@ def run_completion_job(job_id: str):
         reasoning = req.get("reasoning", "medium")
 
         # Decide single vs batch and call the exact methods user provided
-        if isinstance(prompt, list):
-            pairs: List[Tuple[str, str]] = [(system_prompt, str(p)) for p in prompt]
+        if isinstance(prompt, list) and isinstance(system_prompt, list):
+            pairs: List[Tuple[str, str]] = [(system_prompt[i], prompt[i]) for i in range(len(prompt))]
             result_raw = complete_batch(
                 pairs,
                 max_new_tokens=int(max_tokens),
