@@ -4,7 +4,7 @@ import uuid
 import json
 from typing import Any, Dict, Optional, List, Tuple
 
-from app.services.inference import complete, complete_batch
+from app.services.inference import complete_batch
 
 class _Job:
     def __init__(self, payload: Dict[str, Any]):
@@ -70,7 +70,7 @@ def _jsonify_like_notebook(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {str(k): _jsonify_like_notebook(v) for k, v in obj.items()}
 
-    # Last resort: string representation (shows up like [TextContent(text='...')])
+    # Last resort: string representation
     try:
         return repr(obj)
     except Exception:
@@ -87,29 +87,26 @@ def run_completion_job(job_id: str):
 
         req = dict(job.payload)
         prompt = req.get("prompt")
-        system_prompt = req.get("system_prompt", "")
-        max_tokens = req.get("max_tokens", 256)
-        temperature = req.get("temperature", 0.7)
-        reasoning = req.get("reasoning", "medium")
+        system_prompt = req.get("system_prompt")
+        max_tokens = int(req.get("max_tokens", 256))
+        temperature = float(req.get("temperature", 0.7))
+        reasoning = str(req.get("reasoning", "medium"))
 
-        # Decide single vs batch and call the exact methods user provided
-        if isinstance(prompt, list) and isinstance(system_prompt, list):
-            pairs: List[Tuple[str, str]] = [(system_prompt[i], prompt[i]) for i in range(len(prompt))]
-            result_raw = complete_batch(
-                pairs,
-                max_new_tokens=int(max_tokens),
-                reasoning=str(reasoning),
-                temperature=float(temperature),
-            )
-        elif isinstance(prompt, str):
-            result_raw = complete(
-                (system_prompt, prompt),
-                max_new_tokens=int(max_tokens),
-                reasoning=str(reasoning),
-                temperature=float(temperature),
-            )
-        else:
-            raise ValueError("prompt must be a string or a list of strings")
+        # --- Enforce BATCH-ONLY API ---
+        if not isinstance(prompt, list) or not isinstance(system_prompt, list):
+            raise ValueError("batch-only: 'prompt' and 'system_prompt' must both be list[str].")
+
+        if len(prompt) != len(system_prompt):
+            raise ValueError(f"length mismatch: prompt({len(prompt)}) != system_prompt({len(system_prompt)})")
+
+        pairs: List[Tuple[str, str]] = [(system_prompt[i], str(prompt[i])) for i in range(len(prompt))]
+
+        result_raw = complete_batch(
+            pairs,
+            max_new_tokens=max_tokens,
+            reasoning=reasoning,
+            temperature=temperature,
+        )
 
         # Store EXACTLY what we got, JSON-ified minimally via repr for non-JSON types
         result_payload = _jsonify_like_notebook(result_raw)

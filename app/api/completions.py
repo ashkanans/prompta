@@ -13,10 +13,13 @@ async def create_completion_job(
     _auth: Optional[str] = Depends(require_bearer_token),
 ):
     """
-    Submit a single or batch completion job.
+    Submit a BATCH completion job.
+
     Body must include:
-      - prompt: str | list[str]
-      - optionally: system_prompt, max_tokens, temperature, reasoning
+      - prompt: list[str]
+      - system_prompt: list[str]    (MUST have same length as 'prompt')
+      - optionally: max_tokens, temperature, reasoning
+
     We enqueue the job and immediately return a job descriptor.
     """
     # Store the raw payload and run in the background
@@ -31,7 +34,7 @@ async def create_completion_job(
         "id": job.id,
         "object": "completion.job",
         "created": job.created,
-        "status": job.status,   # "queued"
+        "status": job.status,   # "queued" | "running" | ...
         "result": None,
         "error": None,
     }
@@ -55,6 +58,6 @@ async def get_completion_job(job_id: str, response: Response):
         "object": "completion.job",
         "created": job.created,
         "status": job.status,     # queued | running | succeeded | failed
-        "result": job.result,     # EXACTLY what the model methods returned (JSON-ified via repr when needed)
+        "result": job.result,     # EXACTLY what the model methods returned (JSON-safe)
         "error": job.error,
     }
