@@ -98,7 +98,7 @@ def complete_batch(
     # Build chat conversations
     conversations = [
         [
-            {"role": "system", "content": f"Reasoning: {reasoning}\n{sys_prompt}".strip()},
+            {"role": "system", "content": sys_prompt.strip()},
             {"role": "user", "content": user_prompt},
         ]
         for sys_prompt, user_prompt in prompts
